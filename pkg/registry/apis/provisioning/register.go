@@ -187,6 +187,28 @@ type APIBuilder struct {
 	// informer feeds its Store, so it is validated per deployment before the
 	// default flips.
 	keysOnlyReList bool
+
+	// serverReadyHooks start components that need the API server to be serving.
+	// Wire providers register them (see onServerReady) before the server starts.
+	serverReadyHooks []func(serverReady) error
+}
+
+// serverReady carries what is only available once the provisioning API server
+// is serving and the post-start hook has set up the shared controller state.
+type serverReady struct {
+	ctx            context.Context
+	clientset      clientset.Interface
+	resyncInterval time.Duration
+	// Registered once per process and shared by every delta source.
+	relistProjectionMetrics *informer.RelistProjectionMetrics
+	freshnessMetrics        *informer.FreshnessMetrics
+}
+
+// onServerReady registers hook to run from the post-start hook once the API
+// server is serving. Hooks only run on the builder that runs controllers, and
+// must be registered before the server starts.
+func (b *APIBuilder) onServerReady(hook func(serverReady) error) {
+	b.serverReadyHooks = append(b.serverReadyHooks, hook)
 }
 
 // NewAPIBuilder creates an API builder for the provisioning API.
@@ -1311,61 +1333,23 @@ func (b *APIBuilder) GetPostStartHooks() (map[string]genericapiserver.PostStartH
 				}
 			}()
 
-			webhookSecretRotationInterval := b.webhookSecretRotationInterval
-			if webhookSecretRotationInterval <= 0 {
-				// If webhookSecretRotationInterval is not set, use the default value
-				webhookSecretRotationInterval = 30 * 24 * time.Hour
-			}
-
 			// One per process; see RelistProjectionMetrics.
 			relistProjectionMetrics := informer.NewRelistProjectionMetrics(b.registry)
 			// Likewise one per process; see FreshnessMetrics.
 			freshnessMetrics := informer.NewFreshnessMetrics(b.registry)
 
-			// The repository delta source and the getter it backs.
-			var repoKeys keysapi.Lister
-			if b.keysOnlyReList {
-				repoKeys = keysapi.NewGRPCLister(b.unified, provisioning.RepositoryResourceInfo.GroupVersionResource())
-				logging.FromContext(postStartHookCtx.Context).Info("provisioning re-list will ask for keys only", "transport", "storage", "resource", provisioning.RepositoryResourceInfo.GroupVersionResource().Resource)
+			ready := serverReady{
+				ctx:                     postStartHookCtx.Context,
+				clientset:               c,
+				resyncInterval:          informerFactoryResyncInterval,
+				relistProjectionMetrics: relistProjectionMetrics,
+				freshnessMetrics:        freshnessMetrics,
 			}
-			repoSource, reconcileRepoGetter := informer.NewRepositoryDeltaSource(b.natsSubscriber, c, repoKeys, informerFactoryResyncInterval, relistProjectionMetrics, freshnessMetrics)
-			repoController := controller.NewRepositoryController(
-				b.GetClient(),
-				reconcileRepoGetter,
-				b.repoFactory,
-				b.connectionFactory,
-				b.resourceLister,
-				b.clients,
-				b.jobs,
-				b.GetHealthChecker(),
-				b.statusPatcher,
-				b.registry,
-				b.tracer,
-				10,
-				informerFactoryResyncInterval,
-				b.minSyncInterval,
-				30*time.Second,
-				b.quotaGetter,
-				controller.NewRepositoryQuotaChecker(reconcileRepoGetter),
-				b.incrementalPolicy,
-				webhookSecretRotationInterval,
-				nats.Enabled(b.natsSubscriber),
-			)
-			repoReg, err := repoSource.AddEventHandler(repoController.EventHandler())
-			if err != nil {
-				return fmt.Errorf("add repository controller event handler: %w", err)
-			}
-			go repoSource.Run(postStartHookCtx.Done())
-
-			// Wait for the cache to sync off the hot path so we don't block
-			// apiserver startup; the controller only starts its workers once
-			// its handler has processed the initial list.
-			go func() {
-				if !cache.WaitForCacheSync(postStartHookCtx.Done(), repoReg.HasSynced) {
-					return
+			for _, hook := range b.serverReadyHooks {
+				if err := hook(ready); err != nil {
+					return err
 				}
-				repoController.Run(postStartHookCtx.Context, repoControllerWorkers, func() {}, func() {})
-			}()
+			}
 
 			// Create and run connection controller
 			connStatusPatcher := appcontroller.NewConnectionStatusPatcher(b.GetClient())
